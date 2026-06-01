@@ -1,101 +1,65 @@
-# CIFSwitch-Go
+# cifswitch-go
 
-Go port of the CIFSwitch local privilege escalation (embargo lifted 2026-05-27).
+Go port of [CIFSwitch](https://github.com/manizada/CIFSwitch) - CIFS namespace confusion LPE.
 
-> **For authorized security testing, patch validation, and research only.**
-> Run exclusively on systems you own or have explicit written permission to test.
+## How it works (tl;dr)
 
-## Vulnerability
+The bug lives at the intersection of the Linux kernel keyring and the `cifs-utils` userspace helper. The kernel exposes the `cifs.spnego` key type but does not verify that description strings come from kernel code - any unprivileged user can call `request_key("cifs.spnego", forged_description, ...)` directly.
 
-The Linux kernel's CIFS implementation does not validate that `cifs.spnego` key
-descriptions originate from kernel code. An unprivileged user can call
-`request_key("cifs.spnego", forged_description, ...)` directly, causing the
-`cifs.upcall` helper — launched as root by `request-key` — to switch into the
-attacker's mount namespace before it calls `getpwuid()` and before `setuid()`.
+The default `/etc/request-key.conf` rule spawns `/usr/sbin/cifs.upcall` as root to handle the request. The helper parses the description and, when `upcall_target=app` is set, switches into the mount namespace of the PID specified in the `pid=` field. It does this **before** calling `getpwuid()` and before `setuid()`.
 
-A fake NSS library placed in the attacker's namespace runs its constructor with
-root privileges and writes a passwordless sudoers entry.
+**NSS injection**
 
-**Patch:** kernel commit introducing `cifs_spnego_key_vet_description()` which
-validates that descriptions only come from kernel CIFS credential context.
+`getpwuid()` consults NSS. Because the helper is now in the attacker's private mount namespace, it reads the attacker's `nsswitch.conf` and loads modules from the attacker's library directory. The fake `libnss_pwn.so.2` has an `__attribute__((constructor))` that fires on `dlopen()`, writing a passwordless sudoers entry while still running as root.
 
-## Affected
+## Exploit chain
 
-| Distribution | Status |
-|---|---|
-| Linux Mint 21.3 / 22.3 | Exploitable (stock) |
-| CentOS Stream 9, Rocky 9, AlmaLinux 9.7 | Exploitable (stock) |
-| Kali Linux | Exploitable (stock) |
-| Ubuntu 18.04 – 24.04, Debian 11 – 13 | Exploitable if `cifs-utils` installed |
-| Ubuntu 26.04, Fedora 40+, CentOS Stream 10 | Blocked by default LSM policy |
-
-Requires: unprivileged user namespace creation + `cifs.upcall` reachable via
-`request-key.conf`.
-
-## Chain
-
+```text
+unshare(CLONE_NEWUSER|CLONE_NEWNS) ->
+bind-mount fake nsswitch.conf + libnss_pwn.so.2 ->
+request_key("cifs.spnego", forged_desc[upcall_target=app, pid=self]) ->
+cifs.upcall(root) enters attacker mount namespace ->
+getpwuid() -> dlopen(libnss_pwn.so.2) ->
+__attribute__((constructor)) writes /etc/sudoers.d/... ->
+sudo -n /bin/bash -p
 ```
-unshare(CLONE_NEWUSER | CLONE_NEWNS)
-  └─ bind-mount fake nsswitch.conf + libnss_pwn.so.2
-       └─ request_key("cifs.spnego", forged_desc)
-            └─ cifs.upcall (root) switches into attacker mount namespace
-                 └─ getpwuid() → dlopen(libnss_pwn.so.2)
-                      └─ __attribute__((constructor)) writes /etc/sudoers.d/...
-                           └─ sudo -n /bin/bash -p
-```
-
-## Prerequisites
-
-```bash
-sudo apt install cifs-utils gcc          # Ubuntu/Debian
-sudo yum install cifs-utils gcc          # RHEL/Rocky/AlmaLinux
-sudo modprobe cifs                       # ensure kernel module is loaded
-```
-
-Verify:
-```bash
-grep cifs /etc/request-key.conf          # must show cifs.upcall rule
-grep -w cifs /proc/filesystems           # must show "nodev cifs"
-```
-
-## Build
-
-```bash
-go build -o cifswitch-go .
-```
-
-Requires Go 1.18+ and `gcc` (for the NSS shared library compiled at runtime).
 
 ## Usage
 
-```
+```bash
+go build -o cifswitch-go .
 ./cifswitch-go
 ```
 
-If successful, a root shell is spawned via `sudo -n /bin/bash -p`.
+On success drops into a root shell. `gcc` must be available for the NSS shared library compiled at runtime.
 
-**Cleanup after testing:**
+### Cleanup
+
 ```bash
 sudo rm -f /etc/sudoers.d/cifswitch-go-*
 rm -rf /tmp/cifswitch-go-* /tmp/cifswitch-evidence-* /var/tmp/cifswitch-rootsh-*
 ```
 
-## Structure
+## Requirements
 
-| File | Purpose |
+- `cifs-utils` installed (provides `cifs.upcall` and the `request-key.conf` rule)
+- `cifs` kernel module loaded (`sudo modprobe cifs`)
+- Unprivileged user namespace creation enabled
+- `gcc` available (NSS library compiled at runtime)
+
+## Affected distributions
+
+| Distribution | Status |
 |---|---|
-| `main.go` | Entry point, preflight checks, LPE orchestration |
-| `trigger.go` | Namespace setup, `spawnTrigger`, `runTrigger`, `request_key` / `keyctl` wrappers |
-| `nss.go` | Fake NSS library C source, `compileFakeNSS`, `writeNSSwitchConf` |
-
-## Mitigations
-
-- Remove or replace the `cifs.spnego` rule in `/etc/request-key.conf`
-- Disable unprivileged user namespaces: `sysctl -w kernel.unprivileged_userns_clone=0`
-- Remove `cifs-utils` if CIFS mounts are not needed
-- Apply the kernel patch that adds `cifs_spnego_key_vet_description()`
+| Linux Mint 21.3 / 22.3, Kali, CentOS Stream 9, Rocky 9, AlmaLinux 9.7 | Exploitable (stock) |
+| Ubuntu 18.04-24.04, Debian 11-13 | Exploitable if `cifs-utils` installed |
+| Ubuntu 26.04, Fedora 40+, CentOS Stream 10 | Blocked by default LSM policy |
 
 ## References
 
-- Writeup: https://heyitsas.im/posts/cifswitch/
-- Original PoC: https://github.com/manizada/CIFSwitch
+- [manizada/CIFSwitch](https://github.com/manizada/CIFSwitch) - original Python PoC
+- [heyitsas.im - CIFSwitch writeup](https://heyitsas.im/posts/cifswitch/)
+
+## Credits
+
+- **manizada / heyitsas** - vulnerability discovery and original PoC
