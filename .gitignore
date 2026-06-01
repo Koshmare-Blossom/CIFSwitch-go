@@ -1,0 +1,4 @@
+cifswitch-go
+*.o
+*.so
+*.so.2
